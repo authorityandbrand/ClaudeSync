@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""
+r2 — Cloudflare R2 storage CLI wrapper
+Reads credentials from environment variables:
+  Access_Key_ID, Secret_Access_Key, jurisdiction (endpoint URL)
+  Falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / R2_ENDPOINT_URL
+"""
+
+import os
+import sys
+import argparse
+import fnmatch
+import hashlib
+import threading
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+# ── Credentials ──────────────────────────────────────────────────────────────
+
+ACCESS_KEY  = os.environ.get("Access_Key_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+SECRET_KEY  = os.environ.get("Secret_Access_Key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+ENDPOINT    = os.environ.get("jurisdiction") or os.environ.get("R2_ENDPOINT_URL")
+
+if not all([ACCESS_KEY, SECRET_KEY, ENDPOINT]):
+    sys.exit("ERROR: Missing R2 credentials. Set Access_Key_ID, Secret_Access_Key, jurisdiction in environment.")
+
+def get_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=ACCESS_KEY,
+        aws_secret_access_key=SECRET_KEY,
+        region_name="auto",
+        config=Config(signature_version="s3v4", retries={"max_attempts": 3}),
+    )
+
+def get_resource():
+    return boto3.resource(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=ACCESS_KEY,
+        aws_secret_access_key=SECRET_KEY,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_r2_path(path):
+    """'r2://bucket/key/path' → (bucket, key)"""
+    path = path.lstrip("r2://").lstrip("/")
+    parts = path.split("/", 1)
+    bucket = parts[0]
+    key = parts[1] if len(parts) > 1 else ""
+    return bucket, key
+
+def is_r2(path):
+    return path.startswith("r2://")
+
+def human_size(size):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+def list_objects(client, bucket, prefix="", delimiter=""):
+    """Yield all objects under prefix (handles pagination)."""
+    kwargs = {"Bucket": bucket, "Prefix": prefix}
+    if delimiter:
+        kwargs["Delimiter"] = delimiter
+    while True:
+        resp = client.list_objects_v2(**kwargs)
+        yield from resp.get("Contents", [])
+        if delimiter:
+            for cp in resp.get("CommonPrefixes", []):
+                yield {"Key": cp["Prefix"], "Size": 0, "_isPrefix": True}
+        if not resp.get("IsTruncated"):
+            break
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+
+def md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_ls(args):
+    client = get_client()
+    if not args.path:
+        # List all buckets
+        resp = client.list_buckets()
+        for b in resp.get("Buckets", []):
+            print(f"{b['CreationDate'].strftime('%Y-%m-%d %H:%M:%S')}  {b['Name']}")
+        return
+
+    bucket, prefix = parse_r2_path(args.path)
+
+    if args.recursive:
+        total_size = 0
+        count = 0
+        for obj in list_objects(client, bucket, prefix):
+            size = obj.get("Size", 0)
+            total_size += size
+            ts = obj.get("LastModified", "").strftime("%Y-%m-%d %H:%M:%S") if obj.get("LastModified") else ""
+            print(f"{ts}  {human_size(size):>10}  {obj['Key']}")
+            count += 1
+        print(f"\nTotal: {count} objects, {human_size(total_size)}")
+    else:
+        for obj in list_objects(client, bucket, prefix, delimiter="/"):
+            if obj.get("_isPrefix"):
+                print(f"{'':>31}  {'PRE':>10}  {obj['Key']}")
+            else:
+                ts = obj.get("LastModified", "").strftime("%Y-%m-%d %H:%M:%S") if obj.get("LastModified") else ""
+                print(f"{ts}  {human_size(obj['Size']):>10}  {obj['Key']}")
+
+
+def cmd_cp(args):
+    client = get_client()
+    src, dst = args.src, args.dst
+    src_is_r2 = is_r2(src)
+    dst_is_r2 = is_r2(dst)
+
+    if src_is_r2 and dst_is_r2:
+        # R2 → R2 copy
+        sb, sk = parse_r2_path(src)
+        db, dk = parse_r2_path(dst)
+        if not dk:
+            dk = sk.split("/")[-1]
+        client.copy_object(Bucket=db, CopySource={"Bucket": sb, "Key": sk}, Key=dk)
+        print(f"copy: r2://{sb}/{sk} → r2://{db}/{dk}")
+
+    elif src_is_r2 and not dst_is_r2:
+        # Download
+        sb, sk = parse_r2_path(src)
+        local = Path(dst)
+        if local.is_dir():
+            local = local / sk.split("/")[-1]
+        local.parent.mkdir(parents=True, exist_ok=True)
+        print(f"download: r2://{sb}/{sk} → {local}")
+        client.download_file(sb, sk, str(local))
+
+    elif not src_is_r2 and dst_is_r2:
+        # Upload
+        db, dk = parse_r2_path(dst)
+        local = Path(src)
+        if not local.exists():
+            sys.exit(f"ERROR: {src} does not exist")
+        if not dk or dk.endswith("/"):
+            dk = (dk or "") + local.name
+        print(f"upload: {local} → r2://{db}/{dk}")
+        client.upload_file(str(local), db, dk)
+
+    else:
+        sys.exit("ERROR: at least one path must be r2://")
+
+
+def cmd_mv(args):
+    client = get_client()
+    src, dst = args.src, args.dst
+    src_is_r2 = is_r2(src)
+    dst_is_r2 = is_r2(dst)
+
+    if src_is_r2 and dst_is_r2:
+        sb, sk = parse_r2_path(src)
+        db, dk = parse_r2_path(dst)
+        if not dk:
+            dk = sk.split("/")[-1]
+        client.copy_object(Bucket=db, CopySource={"Bucket": sb, "Key": sk}, Key=dk)
+        client.delete_object(Bucket=sb, Key=sk)
+        print(f"move: r2://{sb}/{sk} → r2://{db}/{dk}")
+    elif src_is_r2 and not dst_is_r2:
+        cmd_cp(args)
+        sb, sk = parse_r2_path(src)
+        client.delete_object(Bucket=sb, Key=sk)
+    else:
+        sys.exit("ERROR: source must be r2:// for move")
+
+
+def cmd_rm(args):
+    client = get_client()
+    bucket, key = parse_r2_path(args.path)
+
+    if args.recursive:
+        objects = [{"Key": o["Key"]} for o in list_objects(client, bucket, key)]
+        if not objects:
+            print("Nothing to delete.")
+            return
+        if not args.force:
+            print(f"About to delete {len(objects)} objects from r2://{bucket}/{key}")
+            confirm = input("Confirm? [y/N] ").strip().lower()
+            if confirm != "y":
+                print("Aborted.")
+                return
+        # Batch delete (max 1000 per request)
+        deleted = 0
+        for i in range(0, len(objects), 1000):
+            batch = objects[i:i+1000]
+            resp = client.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+            deleted += len(resp.get("Deleted", []))
+        print(f"Deleted {deleted} objects from r2://{bucket}")
+    else:
+        client.delete_object(Bucket=bucket, Key=key)
+        print(f"delete: r2://{bucket}/{key}")
+
+
+def cmd_sync(args):
+    """rsync-like sync between local↔R2 or R2↔R2."""
+    client = get_client()
+    src, dst = args.src, args.dst
+    src_is_r2 = is_r2(src)
+    dst_is_r2 = is_r2(dst)
+
+    exclude = args.exclude or []
+    include = args.include or []
+    delete  = args.delete
+    dry_run = args.dry_run
+    workers = args.workers
+
+    def should_skip(key):
+        for pat in exclude:
+            if fnmatch.fnmatch(key, pat) or fnmatch.fnmatch(key.split("/")[-1], pat):
+                return True
+        if include:
+            for pat in include:
+                if fnmatch.fnmatch(key, pat) or fnmatch.fnmatch(key.split("/")[-1], pat):
+                    return False
+            return True
+        return False
+
+    # ── Upload: local → R2
+    if not src_is_r2 and dst_is_r2:
+        db, dk_prefix = parse_r2_path(dst)
+        src_path = Path(src)
+        if not src_path.exists():
+            sys.exit(f"ERROR: {src} does not exist")
+
+        # Index existing R2 objects
+        print(f"Indexing r2://{db}/{dk_prefix} ...")
+        remote = {o["Key"]: o for o in list_objects(client, db, dk_prefix)}
+
+        tasks = []
+        for local_file in sorted(src_path.rglob("*")):
+            if not local_file.is_file():
+                continue
+            rel = local_file.relative_to(src_path)
+            key = (dk_prefix.rstrip("/") + "/" + str(rel).replace("\\", "/")).lstrip("/")
+            if should_skip(key):
+                continue
+
+            skip = False
+            if key in remote and not args.force:
+                r_size = remote[key].get("Size", 0)
+                l_size = local_file.stat().st_size
+                if r_size == l_size:
+                    skip = True
+
+            if skip:
+                if args.verbose:
+                    print(f"  skip (same size): {key}")
+                continue
+
+            tasks.append((local_file, key))
+
+        # Deletions
+        if delete:
+            local_keys = set()
+            for local_file in src_path.rglob("*"):
+                if local_file.is_file():
+                    rel = local_file.relative_to(src_path)
+                    key = (dk_prefix.rstrip("/") + "/" + str(rel).replace("\\", "/")).lstrip("/")
+                    local_keys.add(key)
+            to_delete = [k for k in remote if k not in local_keys and k.startswith(dk_prefix)]
+            for k in to_delete:
+                print(f"  {'(dry-run) ' if dry_run else ''}delete: r2://{db}/{k}")
+                if not dry_run:
+                    client.delete_object(Bucket=db, Key=k)
+
+        print(f"Syncing {len(tasks)} files → r2://{db}/{dk_prefix}")
+        if dry_run:
+            for lf, k in tasks:
+                print(f"  (dry-run) upload: {lf} → r2://{db}/{k}")
+            return
+
+        lock = threading.Lock()
+        done = [0]
+
+        def upload_one(item):
+            lf, k = item
+            client.upload_file(str(lf), db, k)
+            with lock:
+                done[0] += 1
+                print(f"  [{done[0]}/{len(tasks)}] upload: {lf.name} → r2://{db}/{k}")
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(upload_one, t) for t in tasks]
+            for f in as_completed(futures):
+                exc = f.exception()
+                if exc:
+                    print(f"  ERROR: {exc}")
+
+    # ── Download: R2 → local
+    elif src_is_r2 and not dst_is_r2:
+        sb, sk_prefix = parse_r2_path(src)
+        dst_path = Path(dst)
+        dst_path.mkdir(parents=True, exist_ok=True)
+
+        print(f"Indexing r2://{sb}/{sk_prefix} ...")
+        objects = [o for o in list_objects(client, sb, sk_prefix) if not o.get("_isPrefix")]
+
+        tasks = []
+        for obj in objects:
+            key = obj["Key"]
+            if should_skip(key):
+                continue
+            rel = key[len(sk_prefix):].lstrip("/")
+            local_file = dst_path / rel
+
+            skip = False
+            if local_file.exists() and not args.force:
+                if local_file.stat().st_size == obj.get("Size", 0):
+                    skip = True
+
+            if skip:
+                if args.verbose:
+                    print(f"  skip (same size): {key}")
+                continue
+            tasks.append((key, local_file, obj.get("Size", 0)))
+
+        if delete:
+            remote_rels = set()
+            for obj in objects:
+                key = obj["Key"]
+                rel = key[len(sk_prefix):].lstrip("/")
+                remote_rels.add(rel)
+            for local_file in dst_path.rglob("*"):
+                if local_file.is_file():
+                    rel = str(local_file.relative_to(dst_path))
+                    if rel not in remote_rels:
+                        print(f"  {'(dry-run) ' if dry_run else ''}delete local: {local_file}")
+                        if not dry_run:
+                            local_file.unlink()
+
+        print(f"Syncing {len(tasks)} files ← r2://{sb}/{sk_prefix}")
+        if dry_run:
+            for key, lf, size in tasks:
+                print(f"  (dry-run) download: r2://{sb}/{key} → {lf}")
+            return
+
+        lock = threading.Lock()
+        done = [0]
+
+        def download_one(item):
+            key, lf, size = item
+            lf.parent.mkdir(parents=True, exist_ok=True)
+            client.download_file(sb, key, str(lf))
+            with lock:
+                done[0] += 1
+                print(f"  [{done[0]}/{len(tasks)}] download: {key} ({human_size(size)})")
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(download_one, t) for t in tasks]
+            for f in as_completed(futures):
+                exc = f.exception()
+                if exc:
+                    print(f"  ERROR: {exc}")
+
+    # ── R2 → R2
+    elif src_is_r2 and dst_is_r2:
+        sb, sk_prefix = parse_r2_path(src)
+        db, dk_prefix = parse_r2_path(dst)
+
+        print(f"Indexing source r2://{sb}/{sk_prefix} ...")
+        src_objects = {o["Key"]: o for o in list_objects(client, sb, sk_prefix)}
+        print(f"Indexing dest   r2://{db}/{dk_prefix} ...")
+        dst_objects = {o["Key"]: o for o in list_objects(client, db, dk_prefix)}
+
+        tasks = []
+        for sk, obj in src_objects.items():
+            rel = sk[len(sk_prefix):].lstrip("/")
+            dk = (dk_prefix.rstrip("/") + "/" + rel).lstrip("/")
+            if should_skip(sk):
+                continue
+            skip = False
+            if dk in dst_objects and not args.force:
+                if dst_objects[dk].get("Size") == obj.get("Size"):
+                    skip = True
+            if skip:
+                if args.verbose:
+                    print(f"  skip: {sk}")
+                continue
+            tasks.append((sk, dk))
+
+        if delete:
+            src_rels = set()
+            for sk in src_objects:
+                rel = sk[len(sk_prefix):].lstrip("/")
+                dk = (dk_prefix.rstrip("/") + "/" + rel).lstrip("/")
+                src_rels.add(dk)
+            for dk in dst_objects:
+                if dk not in src_rels and dk.startswith(dk_prefix):
+                    print(f"  {'(dry-run) ' if dry_run else ''}delete: r2://{db}/{dk}")
+                    if not dry_run:
+                        client.delete_object(Bucket=db, Key=dk)
+
+        print(f"Copying {len(tasks)} objects r2://{sb} → r2://{db}")
+        if dry_run:
+            for sk, dk in tasks:
+                print(f"  (dry-run) copy: r2://{sb}/{sk} → r2://{db}/{dk}")
+            return
+
+        lock = threading.Lock()
+        done = [0]
+
+        def copy_one(item):
+            sk, dk = item
+            client.copy_object(Bucket=db, CopySource={"Bucket": sb, "Key": sk}, Key=dk)
+            with lock:
+                done[0] += 1
+                print(f"  [{done[0]}/{len(tasks)}] copy: {sk} → {dk}")
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(copy_one, t) for t in tasks]
+            for f in as_completed(futures):
+                exc = f.exception()
+                if exc:
+                    print(f"  ERROR: {exc}")
+
+    else:
+        sys.exit("ERROR: at least one path must be r2://")
+
+
+def cmd_mb(args):
+    client = get_client()
+    bucket = args.bucket.lstrip("r2://").strip("/")
+    client.create_bucket(Bucket=bucket)
+    print(f"Created bucket: r2://{bucket}")
+
+
+def cmd_rb(args):
+    client = get_client()
+    bucket = args.bucket.lstrip("r2://").strip("/")
+    if not args.force:
+        confirm = input(f"Delete bucket r2://{bucket}? [y/N] ").strip().lower()
+        if confirm != "y":
+            print("Aborted.")
+            return
+    if args.force:
+        # Empty it first
+        objects = [{"Key": o["Key"]} for o in list_objects(client, bucket)]
+        for i in range(0, len(objects), 1000):
+            client.delete_objects(Bucket=bucket, Delete={"Objects": objects[i:i+1000]})
+    client.delete_bucket(Bucket=bucket)
+    print(f"Deleted bucket: r2://{bucket}")
+
+
+def cmd_presign(args):
+    client = get_client()
+    bucket, key = parse_r2_path(args.path)
+    method = "put_object" if args.put else "get_object"
+    url = client.generate_presigned_url(
+        method,
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=args.expires,
+    )
+    print(url)
+
+
+def cmd_du(args):
+    client = get_client()
+    bucket, prefix = parse_r2_path(args.path)
+    total = 0
+    count = 0
+    for obj in list_objects(client, bucket, prefix):
+        total += obj.get("Size", 0)
+        count += 1
+    print(f"{human_size(total)}\t{count} objects\tr2://{bucket}/{prefix}")
+
+
+def cmd_cat(args):
+    client = get_client()
+    bucket, key = parse_r2_path(args.path)
+    resp = client.get_object(Bucket=bucket, Key=key)
+    data = resp["Body"].read()
+    sys.stdout.buffer.write(data)
+
+
+def cmd_head(args):
+    client = get_client()
+    bucket, key = parse_r2_path(args.path)
+    resp = client.head_object(Bucket=bucket, Key=key)
+    print(f"Key:           {key}")
+    print(f"Bucket:        {bucket}")
+    print(f"Size:          {human_size(resp['ContentLength'])} ({resp['ContentLength']} bytes)")
+    print(f"LastModified:  {resp['LastModified']}")
+    print(f"ContentType:   {resp.get('ContentType', 'N/A')}")
+    etag = resp.get("ETag", "N/A").strip('"')
+    print(f"ETag:          {etag}")
+    meta = resp.get("Metadata", {})
+    if meta:
+        print(f"Metadata:")
+        for k, v in meta.items():
+            print(f"  {k}: {v}")
+
+
+def cmd_find(args):
+    client = get_client()
+    bucket, prefix = parse_r2_path(args.path)
+    pattern = args.name or "*"
+    for obj in list_objects(client, bucket, prefix):
+        name = obj["Key"].split("/")[-1]
+        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(obj["Key"], pattern):
+            size = human_size(obj.get("Size", 0))
+            print(f"r2://{bucket}/{obj['Key']}  ({size})")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="r2",
+        description="Cloudflare R2 storage CLI — wraps all S3-compatible operations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  r2 ls                                      # list all buckets
+  r2 ls r2://my-bucket                       # list top-level keys
+  r2 ls r2://my-bucket/prefix/ -r            # recursive listing
+  r2 cp ./file.txt r2://my-bucket/file.txt   # upload
+  r2 cp r2://my-bucket/file.txt ./           # download
+  r2 cp r2://bucket-a/key r2://bucket-b/key  # R2 to R2 copy
+  r2 mv r2://bucket/old r2://bucket/new      # rename/move
+  r2 rm r2://bucket/file.txt                 # delete object
+  r2 rm r2://bucket/prefix/ -r               # delete all under prefix
+  r2 sync ./local/ r2://bucket/prefix/       # upload directory
+  r2 sync r2://bucket/prefix/ ./local/       # download directory
+  r2 sync r2://src/p/ r2://dst/p/ --delete   # mirror between buckets
+  r2 mb r2://new-bucket                      # create bucket
+  r2 rb r2://old-bucket --force              # delete bucket (empties first)
+  r2 du r2://bucket/prefix/                  # disk usage
+  r2 cat r2://bucket/file.txt                # stream file to stdout
+  r2 head r2://bucket/file.txt               # object metadata
+  r2 find r2://bucket/ --name "*.json"       # find by filename pattern
+  r2 presign r2://bucket/file.txt            # generate presigned GET URL
+  r2 presign r2://bucket/file.txt --put      # generate presigned PUT url
+"""
+    )
+
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    # ls
+    p = sub.add_parser("ls", help="List buckets or objects")
+    p.add_argument("path", nargs="?", help="r2://bucket[/prefix]")
+    p.add_argument("-r", "--recursive", action="store_true")
+
+    # cp
+    p = sub.add_parser("cp", help="Copy files (upload/download/R2→R2)")
+    p.add_argument("src")
+    p.add_argument("dst")
+
+    # mv
+    p = sub.add_parser("mv", help="Move/rename objects")
+    p.add_argument("src")
+    p.add_argument("dst")
+
+    # rm
+    p = sub.add_parser("rm", help="Delete objects")
+    p.add_argument("path", help="r2://bucket/key")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-f", "--force", action="store_true", help="Skip confirmation")
+
+    # sync
+    p = sub.add_parser("sync", help="Sync directories (rsync-like)")
+    p.add_argument("src")
+    p.add_argument("dst")
+    p.add_argument("--delete", action="store_true", help="Delete destination files not in source")
+    p.add_argument("--dry-run", "-n", action="store_true", help="Show what would be transferred")
+    p.add_argument("--exclude", action="append", metavar="PATTERN", help="Exclude pattern (repeatable)")
+    p.add_argument("--include", action="append", metavar="PATTERN", help="Include pattern (overrides exclude)")
+    p.add_argument("--force", action="store_true", help="Transfer even if sizes match")
+    p.add_argument("--verbose", "-v", action="store_true", help="Show skipped files")
+    p.add_argument("--workers", "-j", type=int, default=8, help="Parallel workers (default: 8)")
+
+    # mb
+    p = sub.add_parser("mb", help="Create a bucket")
+    p.add_argument("bucket", help="r2://bucket-name or bucket-name")
+
+    # rb
+    p = sub.add_parser("rb", help="Remove a bucket")
+    p.add_argument("bucket", help="r2://bucket-name or bucket-name")
+    p.add_argument("-f", "--force", action="store_true", help="Empty bucket before deleting")
+
+    # du
+    p = sub.add_parser("du", help="Disk usage for a bucket/prefix")
+    p.add_argument("path", help="r2://bucket[/prefix]")
+
+    # cat
+    p = sub.add_parser("cat", help="Stream object contents to stdout")
+    p.add_argument("path", help="r2://bucket/key")
+
+    # head
+    p = sub.add_parser("head", help="Show object metadata")
+    p.add_argument("path", help="r2://bucket/key")
+
+    # find
+    p = sub.add_parser("find", help="Find objects by name pattern")
+    p.add_argument("path", help="r2://bucket[/prefix]")
+    p.add_argument("--name", "-n", help="Filename glob pattern (e.g. '*.pdf')")
+
+    # presign
+    p = sub.add_parser("presign", help="Generate a presigned URL")
+    p.add_argument("path", help="r2://bucket/key")
+    p.add_argument("--expires", type=int, default=3600, help="Expiry in seconds (default: 3600)")
+    p.add_argument("--put", action="store_true", help="Generate PUT URL instead of GET")
+
+    args = parser.parse_args()
+
+    commands = {
+        "ls": cmd_ls, "cp": cmd_cp, "mv": cmd_mv, "rm": cmd_rm,
+        "sync": cmd_sync, "mb": cmd_mb, "rb": cmd_rb, "du": cmd_du,
+        "cat": cmd_cat, "head": cmd_head, "find": cmd_find, "presign": cmd_presign,
+    }
+
+    if args.command not in commands:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        commands[args.command](args)
+    except ClientError as e:
+        sys.exit(f"R2 Error: {e.response['Error']['Message']}")
+    except KeyboardInterrupt:
+        sys.exit("\nInterrupted.")
+
+
+if __name__ == "__main__":
+    main()
