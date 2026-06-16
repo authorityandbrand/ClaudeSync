@@ -53,6 +53,8 @@ declare -A TOOL_MAP=(
     ["r2-agent-attach.sh"]="${BIN}/r2-attach"
     ["r2-agent-push.sh"]="${BIN}/r2-push"
     ["r2-agent-context.py"]="${BIN}/r2-context"
+    ["r2-catalog.py"]="${BIN}/r2-catalog"
+    ["r2-mount.sh"]="${BIN}/r2-mount"
 )
 
 for src_name in "${!TOOL_MAP[@]}"; do
@@ -64,7 +66,26 @@ for src_name in "${!TOOL_MAP[@]}"; do
     fi
 done
 
-# ── 4. Verify connectivity ────────────────────────────────────────────────────
+# ── 4. Ensure s3fs is installed ───────────────────────────────────────────────
+if ! which s3fs &>/dev/null; then
+    log "Installing s3fs..."
+    apt-get install -y --fix-missing s3fs 2>/dev/null || log "WARN: s3fs install failed"
+fi
+
+# ── 5. Mount all buckets ──────────────────────────────────────────────────────
+if which s3fs &>/dev/null; then
+    MOUNTED=$(ls /mnt/r2/ 2>/dev/null | wc -l)
+    TOTAL=$(r2 ls 2>/dev/null | wc -l)
+    if [[ "$MOUNTED" -lt "$TOTAL" ]]; then
+        log "Mounting R2 buckets (${MOUNTED}/${TOTAL} currently mounted)..."
+        bash "${BIN}/r2-mount" 2>/dev/null || log "WARN: Some mounts failed"
+    else
+        log "All ${MOUNTED} buckets already mounted ✓"
+    fi
+fi
+
+# ── 6. Verify ─────────────────────────────────────────────────────────────────
 BUCKET_COUNT=$(r2 ls 2>/dev/null | wc -l | tr -d ' ')
-log "R2 connected — ${BUCKET_COUNT} buckets available ✓"
-log "Tools ready: r2, r2-attach, r2-push, r2-context"
+MOUNT_COUNT=$(ls /mnt/r2/ 2>/dev/null | wc -l | tr -d ' ')
+log "R2 connected — ${BUCKET_COUNT} buckets, ${MOUNT_COUNT} mounted at /mnt/r2/ ✓"
+log "Tools ready: r2, r2-mount, r2-attach, r2-push, r2-context, r2-catalog"
