@@ -12,6 +12,7 @@ from ctxsync.exceptions import ProviderError
 from ctxsync.gws import (
     DEFAULT_TOKEN_URL,
     GWSAuthUnavailable,
+    GeminiGWSDrive,
     GoogleDrive,
     _TokenSource,
 )
@@ -202,3 +203,17 @@ def test_json_body_and_raw_body_mutually_exclusive():
     drive = GoogleDrive(access_token="t")
     with pytest.raises(ValueError):
         drive.request("POST", "/x", json_body={"a": 1}, raw_body=b"raw")
+
+
+# ------------------------------------------------------------ Gemini MCP trash
+
+
+def test_gemini_trash_sends_trashed_true():
+    """Regression for the placeholder ``starred=False`` bug at gws.py:242."""
+    drive = GeminiGWSDrive(key="mock-key")
+    drive._call = MagicMock(return_value={"id": "f-1", "trashed": True})
+    drive.trash("f-1")
+    # Should be called as ("update", fileId="f-1", trashed=True) — not starred.
+    args, kwargs = drive._call.call_args
+    assert args == ("update",)
+    assert kwargs == {"fileId": "f-1", "trashed": True}

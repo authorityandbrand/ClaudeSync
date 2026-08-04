@@ -40,6 +40,7 @@ import urllib.request
 from typing import Any, Optional
 
 from .exceptions import ProviderError
+from .http import urlopen_with_retry
 
 DEFAULT_GEMINI_GWS_URL = (
     "https://gemini-webapi-worker.authorityandbrand.workers.dev/mcp"
@@ -139,7 +140,7 @@ class GeminiGWSDrive:
         req.add_header("Content-Type", "application/json")
         req.add_header("User-Agent", "ctxsync-drive/0.1")
         try:
-            with urllib.request.urlopen(req, timeout=45) as response:
+            with urlopen_with_retry(req, timeout=45) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raise ProviderError(
@@ -239,7 +240,8 @@ class GeminiGWSDrive:
         return self._call("delete", fileId=file_id)
 
     def trash(self, file_id: str):
-        return self._call("update", fileId=file_id, starred=False)  # placeholder; worker supports 'trashed' via update
+        # Worker's 'update' action accepts the same trashed flag as Drive REST.
+        return self._call("update", fileId=file_id, trashed=True)
 
 
 # --------------------------------------------------------------- Native REST
@@ -329,7 +331,7 @@ class NativeGoogleDrive:
                 req.add_header(name, value)
 
         try:
-            with urllib.request.urlopen(req, timeout=45) as response:
+            with urlopen_with_retry(req, timeout=45) as response:
                 body = response.read()
                 content_type = response.headers.get("Content-Type", "")
         except urllib.error.HTTPError as e:

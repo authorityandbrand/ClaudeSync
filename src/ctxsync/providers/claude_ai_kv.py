@@ -34,6 +34,7 @@ from typing import Optional
 
 from ..auth.kv_session import resolve_session_key
 from ..exceptions import ProviderError
+from ..http import urlopen_with_retry
 from .base_claude_ai import BaseClaudeAIProvider
 
 # What a real installed ClaudeNest desktop client sends. The specific version
@@ -109,7 +110,7 @@ class ClaudeAIKVProvider(BaseClaudeAIProvider):
     # ------------------------------------------------------------ transport
 
     def _make_request_internal(
-        self, method, endpoint, data, base_url, extra_headers=None
+        self, method, endpoint, data, base_url, extra_headers=None, _retry_401=True
     ):
         url = f"{base_url}{endpoint}"
         body = json.dumps(data).encode("utf-8") if data is not None else None
@@ -119,7 +120,7 @@ class ClaudeAIKVProvider(BaseClaudeAIProvider):
             req.add_header(name, value)
 
         try:
-            with urllib.request.urlopen(req, timeout=45) as response:
+            with urlopen_with_retry(req, timeout=45) as response:
                 raw = response.read()
                 if response.headers.get("Content-Encoding") == "gzip":
                     raw = gzip.decompress(raw)
@@ -128,6 +129,15 @@ class ClaudeAIKVProvider(BaseClaudeAIProvider):
                 text = raw.decode("utf-8", "replace")
                 return json.loads(text)
         except urllib.error.HTTPError as e:
+            # A stale-but-syntactically-valid KV key looks fresh to us but
+            # gets rejected by claude.ai. Clear the cache, re-resolve, and
+            # retry exactly once — the KV rotator may have already updated.
+            if e.code == 401 and _retry_401:
+                self._resolved_session_key = None
+                return self._make_request_internal(
+                    method, endpoint, data, base_url, extra_headers,
+                    _retry_401=False,
+                )
             self._raise_for_status(e, url)
         except urllib.error.URLError as e:
             raise ProviderError(f"HTTP transport failed for {url}: {e}") from e
