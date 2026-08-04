@@ -155,12 +155,30 @@ class ClaudeProjects:
 
     # ------------------------------------------------------------- chats
 
-    def chats(self) -> list[dict[str, Any]]:
-        """List chat conversations in the current org."""
-        return self._provider.get_chat_conversations(self._org_id)
+    def chats(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
+        """List chat conversations in the current org.
+
+        The claude.ai endpoint returns the FULL history in one shot with no
+        pagination, so on heavy orgs this can take a while (60–90 s). Pass
+        ``limit`` to slice the result client-side once it arrives.
+        """
+        result = self._provider.get_chat_conversations(self._org_id)
+        if limit and isinstance(result, list):
+            return result[:limit]
+        return result
 
     def chat(self, conversation_id: str) -> dict[str, Any]:
         return self._provider.get_chat_conversation(self._org_id, conversation_id)
+
+    # -------------------------------------------------- published artifacts
+
+    def artifacts(self) -> list[dict[str, Any]]:
+        """List all published artifacts across the current org's chats."""
+        return self._provider.get_published_artifacts(self._org_id)
+
+    def artifact(self, artifact_uuid: str) -> Any:
+        """Return the body of a published artifact by its uuid."""
+        return self._provider.get_artifact_content(self._org_id, artifact_uuid)
 
     # ---------------------------------------------------- chat driving
 
@@ -243,6 +261,25 @@ class Sessions:
 
     def list_environments(self) -> list[dict[str, Any]]:
         return self._provider.get_environments(self._org_id)
+
+    def list_sessions(self) -> Any:
+        """List existing Claude Code Web sessions in the current org.
+
+        Distinct from :meth:`create` — this returns sessions that already
+        exist (yours + any shared), useful for driver scripts that need to
+        pick up where a previous run left off.
+        """
+        return self._provider.get_sessions(self._org_id)
+
+    def code_repos(self, skip_status: bool = True) -> Any:
+        """List code repositories available for Claude Code Web sessions.
+
+        ``skip_status=True`` (default) is much faster; drop it if you need
+        each repo's build/PR state annotated in the response.
+        """
+        return self._provider.get_code_repos(
+            self._org_id, skip_status=skip_status
+        )
 
     def create(
         self,

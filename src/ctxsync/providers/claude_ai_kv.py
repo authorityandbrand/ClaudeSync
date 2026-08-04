@@ -119,8 +119,10 @@ class ClaudeAIKVProvider(BaseClaudeAIProvider):
         for name, value in self._headers(extra_headers).items():
             req.add_header(name, value)
 
+        # 120s handles the very-large-list endpoints (chat_conversations on
+        # heavy orgs returns thousands of rows in one shot with no pagination).
         try:
-            with urlopen_with_retry(req, timeout=45) as response:
+            with urlopen_with_retry(req, timeout=120) as response:
                 raw = response.read()
                 if response.headers.get("Content-Encoding") == "gzip":
                     raw = gzip.decompress(raw)
@@ -160,7 +162,12 @@ class ClaudeAIKVProvider(BaseClaudeAIProvider):
         url = f"{self.base_url}{endpoint}"
         body = json.dumps(data).encode("utf-8") if data is not None else None
         req = urllib.request.Request(url, method=method, data=body)
-        for name, value in self._headers({"Accept": "text/event-stream"}).items():
+        # Force identity on the SSE stream — a gzip'd stream can't be parsed
+        # event-by-event by SSEClient, and the server honors Accept-Encoding.
+        stream_headers = self._headers(
+            {"Accept": "text/event-stream", "Accept-Encoding": "identity"}
+        )
+        for name, value in stream_headers.items():
             req.add_header(name, value)
         try:
             return urllib.request.urlopen(req)
@@ -171,6 +178,7 @@ class ClaudeAIKVProvider(BaseClaudeAIProvider):
         base_url = self.base_url.replace("/api", "")
         extra = {
             "Accept": "text/event-stream",
+            "Accept-Encoding": "identity",
             "anthropic-version": "2023-06-01",
         }
         if organization_id:

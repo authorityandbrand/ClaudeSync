@@ -226,6 +226,70 @@ def test_sessions_run_does_create_send_stream_and_assembles():
     assert text == "part one part two"
 
 
+def test_chats_passes_through_when_no_limit():
+    provider = _mock_provider()
+    provider.get_chat_conversations.return_value = [
+        {"uuid": "c1"}, {"uuid": "c2"}, {"uuid": "c3"}
+    ]
+    cp = ClaudeProjects(provider, "org-1")
+    assert cp.chats() == [{"uuid": "c1"}, {"uuid": "c2"}, {"uuid": "c3"}]
+
+
+def test_chats_slices_when_limit_given():
+    provider = _mock_provider()
+    provider.get_chat_conversations.return_value = [
+        {"uuid": f"c{i}"} for i in range(10)
+    ]
+    cp = ClaudeProjects(provider, "org-1")
+    assert len(cp.chats(limit=3)) == 3
+
+
+def test_chats_limit_zero_slices_to_empty():
+    """Zero is falsy — should be treated as "no limit" like None."""
+    provider = _mock_provider()
+    provider.get_chat_conversations.return_value = [{"uuid": "c1"}]
+    cp = ClaudeProjects(provider, "org-1")
+    # limit=0 is falsy, so behavior matches limit=None (full list)
+    assert cp.chats(limit=0) == [{"uuid": "c1"}]
+
+
+def test_artifacts_delegates_to_provider():
+    provider = _mock_provider()
+    provider.get_published_artifacts.return_value = [
+        {"published_artifact_uuid": "a-1", "artifact_content": "code here"}
+    ]
+    cp = ClaudeProjects(provider, "org-1")
+    result = cp.artifacts()
+    provider.get_published_artifacts.assert_called_once_with("org-1")
+    assert result[0]["published_artifact_uuid"] == "a-1"
+
+
+def test_artifact_returns_content_body():
+    provider = _mock_provider()
+    provider.get_artifact_content.return_value = "the code body"
+    cp = ClaudeProjects(provider, "org-1")
+    result = cp.artifact("a-1")
+    provider.get_artifact_content.assert_called_once_with("org-1", "a-1")
+    assert result == "the code body"
+
+
+def test_sessions_list_delegates_to_get_sessions():
+    provider = _mock_provider()
+    provider.get_sessions.return_value = [{"id": "sess-1"}, {"id": "sess-2"}]
+    cp = ClaudeProjects(provider, "org-1")
+    result = cp.sessions().list_sessions()
+    provider.get_sessions.assert_called_once_with("org-1")
+    assert len(result) == 2
+
+
+def test_sessions_code_repos_forwards_skip_status():
+    provider = _mock_provider()
+    provider.get_code_repos.return_value = {"repos": []}
+    cp = ClaudeProjects(provider, "org-1")
+    cp.sessions().code_repos(skip_status=False)
+    provider.get_code_repos.assert_called_once_with("org-1", skip_status=False)
+
+
 def test_claude_projects_entry_point_wires_org(monkeypatch):
     """Entry point should end up with an active_organization_id set."""
     monkeypatch.setenv("CLAUDE_AI_SESSION_KEY", "sk-ant-sid02-mock")

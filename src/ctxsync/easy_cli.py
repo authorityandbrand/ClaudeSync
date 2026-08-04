@@ -94,9 +94,8 @@ def _cmd_ask(args, cp) -> int:
 
 
 def _cmd_chats(args, cp) -> int:
-    conversations = cp.chats() or []
-    if args.limit:
-        conversations = conversations[: args.limit]
+    # Push the limit into the wrapper so it can short-circuit before slicing
+    conversations = cp.chats(limit=args.limit) or []
     if args.json:
         _emit(conversations, True)
     else:
