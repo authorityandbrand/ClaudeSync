@@ -8,9 +8,12 @@ sandboxed cloud environment:
    ("browser-auth-worker") is expected to log in with a real headed browser
    on a rotation schedule and post the current cookie to a KV namespace.
    This package reads that KV entry at request time.
-2. The container's egress usually has a policy proxy that re-terminates TLS
-   with its own profile. That breaks Chrome-TLS impersonation, so
-   `claude_ai_kv` bypasses `HTTPS_PROXY` for its own calls only.
+2. Cloudflare's edge challenges requests that look like scraper cookie
+   replay. The provider sends the full desktop-client envelope — real
+   `Referer`, `Origin`, `lastActiveOrg` cookie, ClaudeNest Electron
+   user-agent, dual `Bearer` + `Cookie` auth — which is enough for CF to
+   accept the request even from a datacenter IP over the container's
+   existing egress proxy. No TLS-fingerprint tricks required.
 
 ## Required credential
 
