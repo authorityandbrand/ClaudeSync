@@ -2,6 +2,7 @@
 
 from .providers.base_provider import BaseProvider
 from .providers.claude_ai import ClaudeAIProvider
+from .providers.claude_ai_kv import ClaudeAIKVProvider
 
 
 def get_provider(config=None, provider_name=None) -> BaseProvider:
@@ -25,6 +26,7 @@ def get_provider(config=None, provider_name=None) -> BaseProvider:
     """
     providers = {
         "claude.ai": ClaudeAIProvider,
+        "claude.ai-kv": ClaudeAIKVProvider,
         # Add other providers here as they are implemented
     }
 
