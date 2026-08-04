@@ -1,158 +1,247 @@
-"""Google Drive persistent-storage wrapper.
+"""Google Drive wrapper — native REST via a companion token minter.
 
-Second backend for :mod:`ctxsync.easy` — when a file needs to survive
-claude.ai Project turnover, drop it in Drive instead of (or alongside)
-the KB. Scope is intentionally narrow: Drive only. No Gmail, no Docs,
-no Sheets, no Calendar — if you need those, use the MCP tools directly.
+The Google side stays authenticated because a Cloudflare Worker
+(``google-auth-worker``) holds a valid refresh token and mints a fresh
+access token on demand at::
 
-Wire under the gws-worker MCP endpoint so calls run under your
-Google-authenticated worker rather than requiring the caller to hold a
-Google OAuth refresh token. The worker fronts the Drive REST API.
+    GET https://google-auth-worker.authorityandbrand.workers.dev/token
+    -> {"access_token": "ya29.a0A…"}
 
-Auth resolution for the worker's own session-key:
+That access token is what Drive expects as ``Authorization: Bearer``. So
+this wrapper skips every intermediate MCP/worker layer and calls Drive's
+public REST endpoints directly. If the token minter's refresh_token dies
+you replace it in the *worker's* secrets — one place, not four.
 
-1. ``GWS_WORKER_SESSION_KEY`` env var (direct)
-2. ``GWS_WORKER_KV_NAMESPACE`` / ``GWS_WORKER_KV_KEY`` on Cloudflare KV
-   for parity with how ``browser-auth-worker`` rotates the claude.ai key
-3. Raises :class:`GWSAuthUnavailable` if neither is set. Inside a Claude
-   Code session, the ``mcp__GWS_Worker__drive`` tool works without any
-   additional setup and is the recommended path there.
+Nothing here requires ``GWS_WORKER_SESSION_KEY``, ``X-Session-Key``, or
+any Google credential in the caller's env. Only the token endpoint URL
+is configurable, so a different account can point at its own minter.
 
 Usage::
 
     from ctxsync.gws import drive
     d = drive()
-    d.search("name contains 'brief'")
+    d.search("name contains 'brief' and trashed = false")
     d.upload("notes.md", "# hi", folder_id="…")
-    d.download("<file-id>")            # returns str content
-    d.folder("<parent-id>", "New folder")
-    d.delete("<file-id>")
+    d.upload_binary("logo.png", b"…", mime_type="image/png")
+    d.download("<file-id>")
+    d.folder("New folder", parent_id="…")
+    d.metadata("<file-id>")
+    d.move / d.rename / d.delete
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
 from .exceptions import ProviderError
 
-GWS_WORKER_URL = "https://gws-worker.authorityandbrand.workers.dev/mcp"
+DEFAULT_TOKEN_URL = (
+    "https://google-auth-worker.authorityandbrand.workers.dev/token"
+)
+DRIVE_BASE = "https://www.googleapis.com/drive/v3"
+UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
+
+# Refresh a bit before Google's stated expiry (they claim ~1h, we treat as
+# 55 min) so a token that's about to expire mid-request gets rotated first.
+_TOKEN_SAFETY_WINDOW_SECONDS = 300
 
 
 class GWSAuthUnavailable(ProviderError):
-    """Raised when no gws-worker session key can be resolved."""
+    """Raised when the Google access token can't be minted."""
 
 
-def _resolve_worker_key() -> str:
-    env_key = os.environ.get("GWS_WORKER_SESSION_KEY")
-    if env_key:
-        return env_key
+class _TokenSource:
+    """Small in-memory cache around the token minter.
 
-    kv_namespace = os.environ.get("GWS_WORKER_KV_NAMESPACE")
-    kv_key = os.environ.get("GWS_WORKER_KV_KEY", "current_gws_worker_key")
-    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN")
-    cf_account = os.environ.get("CF_ACCOUNT_ID")
-    if kv_namespace and cf_token and cf_account:
-        url = (
-            f"https://api.cloudflare.com/client/v4/accounts/{cf_account}"
-            f"/storage/kv/namespaces/{kv_namespace}/values/{kv_key}"
-        )
-        req = urllib.request.Request(url)
-        req.add_header("Authorization", f"Bearer {cf_token}")
+    Cache lives for the process; every call within the safety window
+    returns the same access token. Once we cross the window we refetch.
+    """
+
+    def __init__(self, token_url: str):
+        self._token_url = token_url
+        self._value: Optional[str] = None
+        self._expires_at: float = 0.0
+
+    def get(self) -> str:
+        now = time.time()
+        if self._value and now < self._expires_at - _TOKEN_SAFETY_WINDOW_SECONDS:
+            return self._value
+        req = urllib.request.Request(self._token_url)
+        req.add_header("User-Agent", "ctxsync-drive/0.1")
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                value = r.read().decode("utf-8").strip()
-                if value:
-                    return value
+            with urllib.request.urlopen(req, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raise GWSAuthUnavailable(
-                f"KV lookup {kv_namespace}/{kv_key}: HTTP {e.code}"
+                f"Token minter {self._token_url} returned HTTP {e.code}: "
+                f"{e.read().decode('utf-8', 'replace')[:200]}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise GWSAuthUnavailable(
+                f"Token minter {self._token_url} unreachable: {e.reason}"
             ) from e
 
-    raise GWSAuthUnavailable(
-        "No GWS worker session key. Set GWS_WORKER_SESSION_KEY, or point "
-        "GWS_WORKER_KV_NAMESPACE at a KV entry a rotation worker publishes. "
-        "Inside Claude Code, the mcp__GWS_Worker__drive tool works with no "
-        "additional setup."
-    )
+        access_token = payload.get("access_token")
+        if not access_token:
+            raise GWSAuthUnavailable(
+                f"Token minter response missing 'access_token': {payload}"
+            )
+        # Google access tokens are ~1h; the minter may or may not tell us
+        # the exact expiry, so treat 3600s as the upper bound.
+        expires_in = int(payload.get("expires_in", 3600))
+        self._value = access_token
+        self._expires_at = now + expires_in
+        return access_token
 
 
 class GoogleDrive:
-    """Thin JSON-RPC client that only exposes Drive.
+    """Native Drive REST client backed by an auto-minted access token.
 
-    Methods return the same dict shape the underlying Drive REST API
-    returns (worker passes it through). See the ``drive`` action list in
-    the gws-worker MCP tool schema for the full parameter set behind
-    :meth:`call`; the named helpers below cover the common ops.
+    Methods return the same dict shape Drive's REST API returns. See
+    ``request`` for the full-control escape hatch when a helper doesn't
+    cover the endpoint you need.
     """
 
-    def __init__(self, session_key: Optional[str] = None, url: str = GWS_WORKER_URL):
-        self._session_key = session_key or _resolve_worker_key()
-        self._url = url
-        self._request_id = 0
-
-    # --------------------------------------------------------- transport
-
-    def call(self, **params: Any) -> Any:
-        """Invoke the worker's ``drive`` tool with the given params.
-
-        Escape hatch for actions the named helpers don't cover
-        (permissions, comments, revisions, labels, activity, etc.).
-        Every helper below is a thin wrapper over this.
-        """
-        self._request_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._request_id,
-            "method": "tools/call",
-            "params": {"name": "drive", "arguments": params},
-        }
-        req = urllib.request.Request(
-            self._url,
-            method="POST",
-            data=json.dumps(payload).encode("utf-8"),
+    def __init__(
+        self,
+        access_token: Optional[str] = None,
+        token_url: Optional[str] = None,
+    ):
+        # If you pass an explicit token we honor it (useful for tests) and
+        # skip the minter entirely; token expiry then becomes your problem.
+        self._explicit_token = access_token
+        url = (
+            token_url
+            or os.environ.get("GOOGLE_AUTH_TOKEN_URL")
+            or DEFAULT_TOKEN_URL
         )
-        req.add_header("Content-Type", "application/json")
-        req.add_header("X-Session-Key", self._session_key)
-        req.add_header("User-Agent", "ctxsync-drive/0.1")
-        try:
-            with urllib.request.urlopen(req, timeout=45) as r:
-                body = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raise ProviderError(
-                f"gws-worker {e.code}: {e.read().decode('utf-8', 'replace')[:400]}"
-            ) from e
+        self._tokens = _TokenSource(url)
 
-        if "error" in body:
-            raise ProviderError(f"gws-worker rpc error: {body['error']}")
-        return body.get("result")
+    # ----------------------------------------------------- transport
+
+    def _access_token(self) -> str:
+        return self._explicit_token or self._tokens.get()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        json_body: Any = None,
+        raw_body: Optional[bytes] = None,
+        extra_headers: Optional[dict] = None,
+    ) -> Any:
+        """Call any Drive endpoint. ``path`` is joined to the v3 base URL.
+
+        Escape hatch for endpoints not covered by the named helpers.
+        Handles token injection, gzip'd responses, and JSON decoding.
+        """
+        url = f"{DRIVE_BASE}{path}"
+        if params:
+            url = url + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+
+        if json_body is not None and raw_body is not None:
+            raise ValueError("json_body and raw_body are mutually exclusive")
+        if json_body is not None:
+            body_bytes = json.dumps(json_body).encode("utf-8")
+        else:
+            body_bytes = raw_body
+
+        req = urllib.request.Request(url, method=method, data=body_bytes)
+        req.add_header("Authorization", f"Bearer {self._access_token()}")
+        req.add_header("User-Agent", "ctxsync-drive/0.1")
+        if json_body is not None:
+            req.add_header("Content-Type", "application/json")
+        if extra_headers:
+            for name, value in extra_headers.items():
+                req.add_header(name, value)
+
+        try:
+            with urllib.request.urlopen(req, timeout=45) as response:
+                body = response.read()
+                content_type = response.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            self._raise_for_status(e, url)
+
+        if not body:
+            return None
+        text = body.decode("utf-8", "replace")
+        if "application/json" in content_type:
+            return json.loads(text)
+        return text
+
+    def _raise_for_status(self, error, url):
+        code = getattr(error, "code", 0)
+        try:
+            body = error.read().decode("utf-8", "replace")
+        except Exception:
+            body = "<no body>"
+        raise ProviderError(f"Drive {code} for {url}: {body[:400]}")
 
     # -------------------------------------------------- browsing / search
 
-    def list_folder(self, folder_id: str, max_results: int = 50):
-        """List direct children of a folder (files + subfolders)."""
-        return self.call(action="list", folderId=folder_id, maxResults=max_results)
-
-    def search(self, query: str, max_results: int = 50):
-        """Drive search — pass a Drive query string.
+    def search(self, query: str, page_size: int = 50, fields: Optional[str] = None):
+        """Drive search. ``query`` is a Drive query string.
 
         Examples:
             ``d.search("name contains 'brief' and trashed = false")``
             ``d.search("mimeType = 'application/pdf'")``
         """
-        return self.call(action="search", query=query, maxResults=max_results)
+        return self.request(
+            "GET",
+            "/files",
+            params={
+                "q": query,
+                "pageSize": page_size,
+                "fields": fields
+                or "files(id,name,mimeType,modifiedTime,parents),nextPageToken",
+            },
+        )
 
-    def get(self, file_id: str):
-        """Metadata + inline content for a file."""
-        return self.call(action="get", fileId=file_id)
+    def list_folder(
+        self,
+        folder_id: str,
+        page_size: int = 50,
+        fields: Optional[str] = None,
+    ):
+        """Direct children of a folder (files + subfolders)."""
+        return self.search(
+            f"'{folder_id}' in parents and trashed = false",
+            page_size=page_size,
+            fields=fields,
+        )
+
+    def get(self, file_id: str, fields: Optional[str] = None):
+        """Metadata for a file."""
+        return self.request(
+            "GET",
+            f"/files/{file_id}",
+            params={
+                "fields": fields or "id,name,mimeType,parents,modifiedTime,size,webViewLink"
+            },
+        )
 
     def metadata(self, file_id: str):
-        """Full metadata (permissions, owners, checksums)."""
-        return self.call(action="metadata", fileId=file_id)
+        """Full metadata: permissions, owners, checksums, view links."""
+        return self.request(
+            "GET",
+            f"/files/{file_id}",
+            params={"fields": "*"},
+        )
+
+    def about(self):
+        """Whoami + storage quota."""
+        return self.request(
+            "GET",
+            "/about",
+            params={"fields": "user(emailAddress,displayName),storageQuota"},
+        )
 
     # ----------------------------------------------------- upload / write
 
@@ -163,16 +252,13 @@ class GoogleDrive:
         folder_id: Optional[str] = None,
         mime_type: str = "text/plain",
     ):
-        """Create a new text file. Use :meth:`upload_binary` for bytes."""
-        params: dict = {
-            "action": "create",
-            "name": name,
-            "content": content,
-            "mimeType": mime_type,
-        }
-        if folder_id:
-            params["folderId"] = folder_id
-        return self.call(**params)
+        """Create a new text file with the given content."""
+        return self.upload_binary(
+            name=name,
+            data=content.encode("utf-8"),
+            folder_id=folder_id,
+            mime_type=mime_type,
+        )
 
     def upload_binary(
         self,
@@ -181,68 +267,128 @@ class GoogleDrive:
         folder_id: Optional[str] = None,
         mime_type: str = "application/octet-stream",
     ):
-        """Upload binary data (PDFs, images, archives) as base64."""
-        params: dict = {
-            "action": "create",
-            "name": name,
-            "content": base64.b64encode(data).decode("ascii"),
-            "contentEncoding": "base64",
-            "mimeType": mime_type,
-        }
+        """Upload bytes via Drive's multipart upload endpoint.
+
+        Small files only — the multipart endpoint is capped at 5 MB. For
+        larger objects use :meth:`resumable_upload` (not implemented; call
+        :meth:`request` with the resumable protocol).
+        """
+        metadata: dict = {"name": name, "mimeType": mime_type}
         if folder_id:
-            params["folderId"] = folder_id
-        return self.call(**params)
+            metadata["parents"] = [folder_id]
+
+        boundary = "----ctxsync-drive-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(metadata)}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        url = f"{UPLOAD_BASE}/files?uploadType=multipart"
+        req = urllib.request.Request(url, method="POST", data=body)
+        req.add_header("Authorization", f"Bearer {self._access_token()}")
+        req.add_header("Content-Type", f"multipart/related; boundary={boundary}")
+        req.add_header("User-Agent", "ctxsync-drive/0.1")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            self._raise_for_status(e, url)
 
     def folder(self, name: str, parent_id: Optional[str] = None):
         """Create a folder. Returns the new folder's metadata."""
-        params: dict = {"action": "folder", "name": name}
+        metadata: dict = {
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+        }
         if parent_id:
-            params["parentId"] = parent_id
-        return self.call(**params)
+            metadata["parents"] = [parent_id]
+        return self.request("POST", "/files", json_body=metadata)
 
     # ----------------------------------------------------------- download
 
     def download(self, file_id: str) -> str:
-        """Return the file's text content (for text files / exports)."""
-        result = self.call(action="get", fileId=file_id)
-        # Worker returns {content: "...", ...} for text files
-        if isinstance(result, dict) and "content" in result:
-            return result["content"]
-        return str(result)
+        """Return a file's text content (or Google-native export as text)."""
+        result = self.request(
+            "GET",
+            f"/files/{file_id}",
+            params={"alt": "media"},
+        )
+        if isinstance(result, (bytes, bytearray)):
+            return result.decode("utf-8", "replace")
+        return result
 
-    def download_url(self, file_id: str):
-        """Return a signed URL / temporary download endpoint."""
-        return self.call(action="download", fileId=file_id)
+    def download_binary(self, file_id: str) -> bytes:
+        """Return raw bytes for a file — for PDFs, images, archives, etc."""
+        url = f"{DRIVE_BASE}/files/{file_id}?alt=media"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {self._access_token()}")
+        req.add_header("User-Agent", "ctxsync-drive/0.1")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return response.read()
+        except urllib.error.HTTPError as e:
+            self._raise_for_status(e, url)
 
-    def export(self, file_id: str, mime_type: str):
+    def export(self, file_id: str, mime_type: str) -> str:
         """Export a Google-native file (Doc/Sheet/Slide) as another format."""
-        return self.call(action="export", fileId=file_id, mimeType=mime_type)
+        return self.request(
+            "GET",
+            f"/files/{file_id}/export",
+            params={"mimeType": mime_type},
+        )
 
-    # ----------------------------------------------------- move / delete
+    # ----------------------------------------------------- move / rename
 
     def move(self, file_id: str, target_folder_id: str):
-        return self.call(
-            action="move", fileId=file_id, targetFolderId=target_folder_id
+        """Move a file to a different parent folder."""
+        # Discover the current parents so we can remove them cleanly
+        current = self.get(file_id, fields="parents")
+        remove = ",".join(current.get("parents", []))
+        return self.request(
+            "PATCH",
+            f"/files/{file_id}",
+            params={
+                "addParents": target_folder_id,
+                "removeParents": remove,
+                "fields": "id,name,parents",
+            },
+            json_body={},
         )
 
     def rename(self, file_id: str, new_name: str):
-        return self.call(action="update", fileId=file_id, name=new_name)
+        return self.request(
+            "PATCH",
+            f"/files/{file_id}",
+            json_body={"name": new_name},
+        )
 
     def delete(self, file_id: str):
-        """PERMANENT delete. Trash it via ``update`` if you want reversible."""
-        return self.call(action="delete", fileId=file_id)
+        """PERMANENT delete. Trash it with :meth:`trash` for reversible."""
+        return self.request("DELETE", f"/files/{file_id}")
+
+    def trash(self, file_id: str):
+        """Move to trash (reversible for 30 days)."""
+        return self.request(
+            "PATCH",
+            f"/files/{file_id}",
+            json_body={"trashed": True},
+        )
 
 
 def drive() -> GoogleDrive:
-    """One-line entry point mirroring :func:`ctxsync.easy.claude_projects`.
+    """One-line entry point.
 
     >>> from ctxsync.gws import drive
     >>> d = drive()
-    >>> d.search("name contains 'brief' and trashed = false")
+    >>> d.about()
+    {'user': {'emailAddress': '…', 'displayName': '…'}, 'storageQuota': {...}}
     """
     return GoogleDrive()
 
 
-# Backwards-compat alias in case anything's already imported the old name.
+# Backwards-compat aliases
 GoogleWorkspace = GoogleDrive
 gws = drive
