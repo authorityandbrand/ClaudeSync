@@ -59,6 +59,7 @@ test = [
 
 [project.scripts]
 ctxsync = "ctxsync.cli.main:cli"
+ctxsync-easy = "ctxsync.easy_cli:main"
 
 [build-system]
 requires = ["setuptools>=42", "wheel"]
