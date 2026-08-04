@@ -19,16 +19,46 @@ call raises :class:`AmbiguousProjectError` with the candidates listed.
 The active organization is auto-picked when there's only one usable org
 on your account. If you have more than one, either pass ``org_id=`` to
 :func:`claude_projects` or set the ``ORG_ID`` env var.
+
+For chat driving and Claude Code Web sessions, use :meth:`ClaudeProjects.ask`
+(new chat + prompt + assembled reply) or :meth:`ClaudeProjects.sessions`
+(the ``Sessions`` facade for headless coding sessions).
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .configmanager import InMemoryConfigManager
 from .exceptions import ProviderError
 from .providers.claude_ai_kv import ClaudeAIKVProvider
+
+
+# Text extraction from streamed events. Claude.ai's SSE emits a few
+# shapes across chat vs session and old vs new API versions — rather than
+# spread the field-name knowledge through every caller, one aggregator
+# pulls whatever text is there.
+def _event_text(event: Any) -> str:
+    if not isinstance(event, dict):
+        return ""
+    # Chat "completion" events carry the delta as a plain "completion" str.
+    completion = event.get("completion")
+    if isinstance(completion, str):
+        return completion
+    # Newer content_block_delta / message_delta events tuck the text under
+    # delta.text (chat) or delta.output_text_delta (some session variants).
+    delta = event.get("delta")
+    if isinstance(delta, dict):
+        for key in ("text", "output_text_delta", "text_delta"):
+            value = delta.get(key)
+            if isinstance(value, str):
+                return value
+    # Session assistant_message shape: {"type":"assistant_message","text":"..."}
+    text = event.get("text")
+    if isinstance(text, str):
+        return text
+    return ""
 
 
 class AmbiguousProjectError(ProviderError):
@@ -131,6 +161,138 @@ class ClaudeProjects:
 
     def chat(self, conversation_id: str) -> dict[str, Any]:
         return self._provider.get_chat_conversation(self._org_id, conversation_id)
+
+    # ---------------------------------------------------- chat driving
+
+    def new_chat(
+        self,
+        project: str,
+        name: str = "",
+        model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a new chat in ``project`` (uuid or name)."""
+        project_id = self.find_project(project)["id"]
+        return self._provider.create_chat(
+            self._org_id,
+            chat_name=name,
+            project_uuid=project_id,
+            model=model,
+        )
+
+    def send(
+        self,
+        chat_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        timezone: str = "UTC",
+    ) -> Iterator[dict[str, Any]]:
+        """Stream events from ``send_message``. Yields raw parsed dicts.
+
+        For a synchronous "just give me the reply" call, use :meth:`ask`
+        instead — it consumes this iterator and returns assembled text.
+        """
+        yield from self._provider.send_message(
+            self._org_id,
+            chat_id,
+            prompt,
+            timezone=timezone,
+            model=model,
+        )
+
+    def ask(
+        self,
+        project: str,
+        prompt: str,
+        model: Optional[str] = None,
+    ) -> str:
+        """One-shot: new chat + send + assemble → the assistant's reply."""
+        chat = self.new_chat(project, model=model)
+        chat_id = chat.get("uuid") or chat.get("id")
+        if not chat_id:
+            raise ProviderError(
+                f"create_chat returned no id/uuid; payload was {chat!r}"
+            )
+        parts: list[str] = []
+        for event in self.send(chat_id, prompt, model=model):
+            parts.append(_event_text(event))
+        return "".join(parts)
+
+    def delete_chats(self, conversation_uuids: list[str]) -> Any:
+        """Bulk-delete chat conversations."""
+        return self._provider.delete_chat(self._org_id, conversation_uuids)
+
+    # ------------------------------------------------ sessions facade
+
+    def sessions(self) -> "Sessions":
+        """Return the :class:`Sessions` helper bound to the current org."""
+        return Sessions(self._provider, self._org_id)
+
+
+class Sessions:
+    """Helper for Claude Code Web sessions (the ``/v1/sessions`` endpoints).
+
+    Distinct from chat conversations: sessions get a container + a git
+    repo attached and can push branches back to GitHub. Use this from a
+    driver script that spawns a headless coding session, waits for it to
+    finish, and reads back the assembled output.
+    """
+
+    def __init__(self, provider: ClaudeAIKVProvider, org_id: str):
+        self._provider = provider
+        self._org_id = org_id
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        return self._provider.get_environments(self._org_id)
+
+    def create(
+        self,
+        title: str,
+        environment_id: str,
+        git_repo_url: Optional[str] = None,
+        git_repo_owner: Optional[str] = None,
+        git_repo_name: Optional[str] = None,
+        branch_name: Optional[str] = None,
+        model: str = "claude-sonnet-4-5-20250929",
+    ) -> dict[str, Any]:
+        return self._provider.create_session(
+            self._org_id,
+            title=title,
+            environment_id=environment_id,
+            git_repo_url=git_repo_url,
+            git_repo_owner=git_repo_owner,
+            git_repo_name=git_repo_name,
+            branch_name=branch_name,
+            model=model,
+        )
+
+    def send_input(self, session_id: str, prompt: str) -> Any:
+        return self._provider.send_session_input(self._org_id, session_id, prompt)
+
+    def stream_events(self, session_id: str) -> Iterator[dict[str, Any]]:
+        yield from self._provider.stream_session_events(self._org_id, session_id)
+
+    def archive(self, session_id: str) -> Any:
+        return self._provider.archive_session(self._org_id, session_id)
+
+    def run(
+        self,
+        title: str,
+        environment_id: str,
+        prompt: str,
+        **repo_kwargs: Any,
+    ) -> str:
+        """create → send_input → stream_events → return assembled text."""
+        session = self.create(title, environment_id, **repo_kwargs)
+        session_id = session.get("id") or session.get("uuid")
+        if not session_id:
+            raise ProviderError(
+                f"create_session returned no id/uuid; payload was {session!r}"
+            )
+        self.send_input(session_id, prompt)
+        parts: list[str] = []
+        for event in self.stream_events(session_id):
+            parts.append(_event_text(event))
+        return "".join(parts)
 
 
 def _pick_org(provider: ClaudeAIKVProvider, org_hint: Optional[str]) -> str:

@@ -8,6 +8,8 @@ Registered as the ``ctxsync-easy`` console script. Sub-commands:
   ctxsync-easy upload <project> <file_name> [<local_path>|-]
   ctxsync-easy create <name> [--desc TEXT]
   ctxsync-easy archive <project>
+  ctxsync-easy ask <project> <prompt> [--model MODEL]
+  ctxsync-easy chats [--limit N]
 
 ``<project>`` accepts a project uuid or a case-insensitive name. Reading
 content from stdin uses ``-`` as the local path (e.g. ``echo hi | ...
@@ -85,6 +87,26 @@ def _cmd_archive(args, cp) -> int:
     return 0
 
 
+def _cmd_ask(args, cp) -> int:
+    reply = cp.ask(args.project, args.prompt, model=args.model)
+    _emit(reply, args.json)
+    return 0
+
+
+def _cmd_chats(args, cp) -> int:
+    conversations = cp.chats() or []
+    if args.limit:
+        conversations = conversations[: args.limit]
+    if args.json:
+        _emit(conversations, True)
+    else:
+        for convo in conversations:
+            uuid = convo.get("uuid") or convo.get("id") or "-"
+            name = convo.get("name") or "(untitled)"
+            print(f"{uuid}  {name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ctxsync-easy")
     parser.add_argument(
@@ -115,6 +137,20 @@ def build_parser() -> argparse.ArgumentParser:
     archive_parser = sub.add_parser("archive", help="Archive a project")
     archive_parser.add_argument("project", help="Project uuid or name")
 
+    ask_parser = sub.add_parser(
+        "ask", help="Create a chat, send a prompt, print the reply"
+    )
+    ask_parser.add_argument("project", help="Project uuid or name")
+    ask_parser.add_argument("prompt", help="Prompt text (quote it)")
+    ask_parser.add_argument("--model", default=None, help="Model override")
+
+    chats_parser = sub.add_parser(
+        "chats", help="List chat conversations in the current org"
+    )
+    chats_parser.add_argument(
+        "--limit", type=int, default=None, help="Cap at N most-recent chats"
+    )
+
     return parser
 
 
@@ -128,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         "upload": _cmd_upload,
         "create": _cmd_create,
         "archive": _cmd_archive,
+        "ask": _cmd_ask,
+        "chats": _cmd_chats,
     }[args.cmd]
     return handler(args, cp)
 
