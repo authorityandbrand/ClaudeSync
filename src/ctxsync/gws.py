@@ -72,8 +72,10 @@ def _resolve_gemini_gws_key() -> Optional[str]:
     kv_namespace = os.environ.get("GEMINI_GWS_KV_NAMESPACE")
     kv_key = os.environ.get("GEMINI_GWS_KV_KEY", "gemini_gws_key")
     cf_token = os.environ.get("CLOUDFLARE_API_TOKEN")
-    cf_account = os.environ.get("CF_ACCOUNT_ID")
-    if kv_namespace and cf_token and cf_account:
+    # Default account matches auth/kv_session.py so users don't have to set
+    # both CF_ACCOUNT_ID and the KV pointer just to make this path work.
+    cf_account = os.environ.get("CF_ACCOUNT_ID", "e105d76aa6c851abdbd13d34d901cc7c")
+    if kv_namespace and cf_token:
         url = (
             f"https://api.cloudflare.com/client/v4/accounts/{cf_account}"
             f"/storage/kv/namespaces/{kv_namespace}/values/{kv_key}"
