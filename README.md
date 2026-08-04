@@ -31,10 +31,11 @@ Please review [Anthropic's Terms of Service](https://www.anthropic.com/legal/con
 ## 🌟 Features
 
 - **File sync**: Synchronize local files with [Claude.ai projects](https://www.anthropic.com/news/projects).
+- **Python API**: Drive Claude.ai projects and Google Drive from your own scripts (`ctxsync.easy`, `ctxsync.gws`).
+- **Cloud / KV auth**: Run from any container or CI runner — session key resolves from a Cloudflare KV namespace, no interactive login required.
+- **Companion CLIs**: `ctxsync-easy` (projects, chats, sessions) and `ctxsync-drive` (Google Drive ops) sit alongside the classic `ctxsync push/pull`.
 - **Cross-Platform**: Compatible with [Windows, macOS, and Linux](https://github.com/jahwag/ctxsync/releases).
 - **Configurable**: Plenty of [configuration options](https://github.com/jahwag/ctxsync/wiki/Quick-reference).
-- **Integrate**: Designed to be easy to integrate into your pipelines.
-- **Secure**: Ensures data privacy and security.
 
 ## ⚙️ Prerequisites
 
@@ -44,18 +45,116 @@ Please review [Anthropic's Terms of Service](https://www.anthropic.com/legal/con
 |--------|-----------|
 | Pro    | ✅        |
 | Team   | ✅        |
+| Max    | ✅        |
 | Free   | ❌        |
-
-### 🔑 SSH Key
-
-Ensure you have an SSH key for secure credential storage. Follow [GitHub's guide](https://docs.github.com/en/authentication/connecting-to-github-with-ssh) to generate and add your SSH key.
 
 ### 💻 Software
 
 - **Python**: ≥ [3.10](https://www.python.org/downloads/)
 - **pip**: [Python package installer](https://pip.pypa.io/en/stable/installation/)
 
-## 🚀 Quick Start
+### 🔑 Credentials
+
+Two ways to auth, pick whichever fits:
+
+- **Local / interactive** — `ctxsync auth login` stores the session key via your SSH key (see [GitHub's guide](https://docs.github.com/en/authentication/connecting-to-github-with-ssh) to generate one). Used by the classic `ctxsync push/pull` flow.
+- **Cloud / KV** — set `CLOUDFLARE_API_TOKEN` and the Python API + `ctxsync-easy` CLI resolve the current session key from a Cloudflare KV namespace at request time. No `.env` cookie, no SSH key needed. Details in [`src/ctxsync/auth/README.md`](src/ctxsync/auth/README.md).
+
+## 🐍 Python API + cloud auth
+
+The `ctxsync.easy` module is a one-line-per-task facade over the claude.ai
+provider — designed for automation scripts and notebooks that just need to
+drive a project without dealing with the raw REST surface.
+
+```python
+from ctxsync.easy import claude_projects
+
+cp = claude_projects()                                 # auto-picks org
+cp.list_projects()                                     # most-recent first
+cp.find_project("Bookmarked")                          # uuid or case-insensitive name
+cp.docs("Bookmarked")                                  # list docs in a project
+cp.upload("Bookmarked", "notes.md", "# hello")         # add a doc
+cp.delete_doc("Bookmarked", "<doc-uuid>")              # remove one
+cp.create_project("scratch", description="notes")      # new project
+cp.archive_project("scratch")                          # archive it
+
+# Chat driving
+cp.ask("Bookmarked", "Summarize this project's docs")  # → assembled reply text
+for event in cp.send("<chat-uuid>", "hi"): ...         # → raw SSE dicts
+cp.chats()                                             # list conversations
+
+# Claude Code Web sessions
+sessions = cp.sessions()
+sessions.list_environments()
+sessions.run(title="fix bug", environment_id="env_...", prompt="...")
+```
+
+Google Drive gets the same treatment — one module, two swappable backends,
+same public API on both:
+
+```python
+from ctxsync.gws import drive
+
+d = drive()                                            # auto-picks backend
+d.about()                                              # {user, storageQuota}
+d.search("name contains 'q3'")                         # Drive query string
+d.list_folder("<folder-id>")
+d.upload("notes.md", "# hi", folder_id="<folder-id>")  # text
+d.upload_binary("logo.png", png_bytes, folder_id="<folder-id>", mime_type="image/png")
+d.folder("New folder", parent_id="<folder-id>")        # mkdir
+d.move("<file-id>", "<target-folder-id>")
+d.rename("<file-id>", "renamed.md")
+d.trash("<file-id>")                                   # reversible
+d.delete("<file-id>")                                  # permanent
+d.download("<file-id>")                                # text
+```
+
+Both backends are live-verified:
+
+- **Gemini_Gws MCP** (preferred) — routes through a shared Cloudflare Worker that owns a persistent Google OAuth session. Zero token handling on your side; the worker rotates its own refresh token. Selected when `GEMINI_GWS_KEY` resolves (either from env or KV).
+- **Native REST** (fallback) — mints an access token from `google-auth-worker` and calls `www.googleapis.com/drive/v3/*` directly. Selected when no Gemini_Gws key is available.
+
+`drive()` picks the first backend whose auth resolves. Force one with
+`drive(prefer="gemini")` or `drive(prefer="native")`.
+
+### Companion CLIs
+
+`ctxsync-easy` mirrors the Python API from the shell:
+
+```shell
+ctxsync-easy orgs                                      # list usable orgs
+ctxsync-easy projects [--all] [--json]                 # list projects
+ctxsync-easy docs <project>                            # list docs in a project
+ctxsync-easy upload <project> <name> [<path>|-]        # upload (- reads stdin)
+ctxsync-easy create <name> [--desc TEXT]
+ctxsync-easy archive <project>
+ctxsync-easy ask <project> "prompt" [--model MODEL]    # one-shot chat
+ctxsync-easy chats [--limit N]
+```
+
+`ctxsync-drive` does the same for Google Drive:
+
+```shell
+ctxsync-drive about
+ctxsync-drive ls <folder-id> [--max N]
+ctxsync-drive search "<query>" [--max N]
+ctxsync-drive upload <path>|- [--folder-id ID] [--name NAME] [--mime TYPE]
+ctxsync-drive mkdir <name> [--parent-id ID]
+ctxsync-drive mv <file-id> <target-folder-id>
+ctxsync-drive rename <file-id> <new-name>
+ctxsync-drive trash <file-id>                          # reversible
+ctxsync-drive rm <file-id> --yes                       # permanent
+ctxsync-drive download <file-id> <path>
+ctxsync-drive sync <folder-id> <project> [--dry-run] [--include GLOB] [--exclude GLOB]
+```
+
+`--json` on either CLI emits JSON instead of pretty tables.
+`--backend {auto,gemini,native}` on `ctxsync-drive` forces a specific Drive backend.
+
+## 🚀 Classic Quick Start
+
+The original file-sync flow is unchanged — this is still the primary path for
+most users pushing a local repo up to a Claude.ai project.
 
 1. **Install ctxsync**
     ```shell
